@@ -1,0 +1,10 @@
+[server]
+maxUploadSize = 10
+enableXsrfProtection = false
+
+[theme]
+base = "light"
+backgroundColor = "#f7f5f0"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1c1917"
+primaryColor = "#c8502a"
