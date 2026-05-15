@@ -4,8 +4,11 @@ indexa documentos e busca chunks por categoria para retrieval híbrido.
 """
 
 import json
+from contextlib import contextmanager
+
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from openai import OpenAI
 
 from src import config
@@ -31,64 +34,101 @@ class EmbeddingClient:
 class KnowledgeBase:
     def __init__(self):
         self.embedder = EmbeddingClient()
-        self.conn = psycopg2.connect(config.DATABASE_URL)
-        self.conn.autocommit = True
+        self._pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=1,
+            maxconn=5,
+            dsn=config.DATABASE_URL,
+            # Mantém conexões vivas no Railway
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
+        )
         self._ensure_table()
 
+    @contextmanager
+    def _get_conn(self):
+        """
+        Pega uma conexão do pool, devolve ao final.
+        Se estiver morta (Railway matou por idle), descarta e reconecta.
+        """
+        conn = self._pool.getconn()
+        try:
+            # Testa se a conexão ainda está viva
+            if conn.closed:
+                self._pool.putconn(conn, close=True)
+                conn = self._pool.getconn()
+            conn.autocommit = True
+            yield conn
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            # Conexão morta: descarta e tenta de novo com uma nova
+            self._pool.putconn(conn, close=True)
+            conn = self._pool.getconn()
+            conn.autocommit = True
+            yield conn
+        finally:
+            self._pool.putconn(conn)
+
     def _ensure_table(self):
-        with self.conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {config.TABLE_NAME} (
-                    id BIGSERIAL PRIMARY KEY,
-                    conteudo TEXT NOT NULL,
-                    metadata JSONB,
-                    embedding VECTOR(1536)
-                );
-            """)
-            cur.execute(f"""
-                CREATE INDEX IF NOT EXISTS {config.TABLE_NAME}_embedding_idx
-                ON {config.TABLE_NAME} USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = 100);
-            """)
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {config.TABLE_NAME} (
+                        id BIGSERIAL PRIMARY KEY,
+                        conteudo TEXT NOT NULL,
+                        metadata JSONB,
+                        embedding VECTOR(1536)
+                    );
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS {config.TABLE_NAME}_embedding_idx
+                    ON {config.TABLE_NAME} USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = 100);
+                """)
 
     def count(self) -> int:
-        with self.conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM {config.TABLE_NAME};")
-            return cur.fetchone()[0]
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {config.TABLE_NAME};")
+                return cur.fetchone()[0]
 
     def existing_sources(self) -> set[str]:
-        with self.conn.cursor() as cur:
-            cur.execute(
-                f"SELECT DISTINCT metadata->>'source' FROM {config.TABLE_NAME};"
-            )
-            return {row[0] for row in cur.fetchall() if row[0]}
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT DISTINCT metadata->>'source' FROM {config.TABLE_NAME};"
+                )
+                return {row[0] for row in cur.fetchall() if row[0]}
 
     def existing_hashes(self) -> set[str]:
-        with self.conn.cursor() as cur:
-            cur.execute(
-                f"SELECT DISTINCT metadata->>'content_hash' FROM {config.TABLE_NAME};"
-            )
-            return {row[0] for row in cur.fetchall() if row[0]}
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT DISTINCT metadata->>'content_hash' FROM {config.TABLE_NAME};"
+                )
+                return {row[0] for row in cur.fetchall() if row[0]}
 
     def remove_by_source(self, source: str):
-        with self.conn.cursor() as cur:
-            cur.execute(
-                f"DELETE FROM {config.TABLE_NAME} WHERE metadata->>'source' = %s;",
-                (source,)
-            )
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {config.TABLE_NAME} WHERE metadata->>'source' = %s;",
+                    (source,)
+                )
 
     def add_chunks(self, chunks: list[str], metadatas: list[dict], _ids=None):
         if not chunks:
             return
         embeddings = self.embedder.embed(chunks)
-        with self.conn.cursor() as cur:
-            for chunk, meta, emb in zip(chunks, metadatas, embeddings):
-                cur.execute(
-                    f"INSERT INTO {config.TABLE_NAME} (conteudo, metadata, embedding) "
-                    f"VALUES (%s, %s, %s)",
-                    (chunk, json.dumps(meta), emb)
-                )
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                for chunk, meta, emb in zip(chunks, metadatas, embeddings):
+                    cur.execute(
+                        f"INSERT INTO {config.TABLE_NAME} (conteudo, metadata, embedding) "
+                        f"VALUES (%s, %s, %s)",
+                        (chunk, json.dumps(meta), emb)
+                    )
 
     def search(self, query: str, top_k: int = None) -> list[dict]:
         """
@@ -104,49 +144,51 @@ class KnowledgeBase:
         seen_ids = set()
 
         for category, k in config.RETRIEVAL_PLAN.items():
-            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(f"""
-                    SELECT id, conteudo, metadata,
-                           1 - (embedding <=> %s::vector) AS similarity
-                    FROM {config.TABLE_NAME}
-                    WHERE metadata->>'category' = %s
-                      AND 1 - (embedding <=> %s::vector) >= %s
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s;
-                """, (emb_str, category, emb_str, config.MIN_SIMILARITY, emb_str, k))
+            with self._get_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(f"""
+                        SELECT id, conteudo, metadata,
+                               1 - (embedding <=> %s::vector) AS similarity
+                        FROM {config.TABLE_NAME}
+                        WHERE metadata->>'category' = %s
+                          AND 1 - (embedding <=> %s::vector) >= %s
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s;
+                    """, (emb_str, category, emb_str, config.MIN_SIMILARITY, emb_str, k))
 
-                rows = cur.fetchall()
-                for row in rows:
-                    if row["id"] not in seen_ids:
-                        seen_ids.add(row["id"])
-                        all_hits.append({
-                            "text": row["conteudo"],
-                            "metadata": row["metadata"],
-                            "similarity": float(row["similarity"]),
-                        })
+                    rows = cur.fetchall()
+                    for row in rows:
+                        if row["id"] not in seen_ids:
+                            seen_ids.add(row["id"])
+                            all_hits.append({
+                                "text": row["conteudo"],
+                                "metadata": row["metadata"],
+                                "similarity": float(row["similarity"]),
+                            })
 
         # Se alguma categoria não teve hits suficientes, complementa com busca geral
         if len(all_hits) < top_k:
             deficit = top_k - len(all_hits)
-            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(f"""
-                    SELECT id, conteudo, metadata,
-                           1 - (embedding <=> %s::vector) AS similarity
-                    FROM {config.TABLE_NAME}
-                    WHERE 1 - (embedding <=> %s::vector) >= %s
-                      AND id != ALL(%s)
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s;
-                """, (emb_str, emb_str, config.MIN_SIMILARITY,
-                      list(seen_ids) or [0], emb_str, deficit))
-                for row in cur.fetchall():
-                    if row["id"] not in seen_ids:
-                        seen_ids.add(row["id"])
-                        all_hits.append({
-                            "text": row["conteudo"],
-                            "metadata": row["metadata"],
-                            "similarity": float(row["similarity"]),
-                        })
+            with self._get_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(f"""
+                        SELECT id, conteudo, metadata,
+                               1 - (embedding <=> %s::vector) AS similarity
+                        FROM {config.TABLE_NAME}
+                        WHERE 1 - (embedding <=> %s::vector) >= %s
+                          AND id != ALL(%s)
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s;
+                    """, (emb_str, emb_str, config.MIN_SIMILARITY,
+                          list(seen_ids) or [0], emb_str, deficit))
+                    for row in cur.fetchall():
+                        if row["id"] not in seen_ids:
+                            seen_ids.add(row["id"])
+                            all_hits.append({
+                                "text": row["conteudo"],
+                                "metadata": row["metadata"],
+                                "similarity": float(row["similarity"]),
+                            })
 
         # Ordena por similaridade
         all_hits.sort(key=lambda x: x["similarity"], reverse=True)
